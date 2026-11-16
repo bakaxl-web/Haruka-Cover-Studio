@@ -1,0 +1,35 @@
+# 依赖与构建产物
+node_modules/
+dist/
+release/
+release-light/
+runtime/
+model-bundle/
+release-models/
+.cache/
+.build/
+dist-electron/
+
+# Python 环境与缓存
+backend/.venv/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/.pytest_cache/
+
+# 运行时数据（本机模型库、输出、日志）
+runs/
+outputs/
+*.log
+
+# 本地敏感配置
+.env
+config.local.json
+*.local.json
+backend/vendor/artifacts/
+*.pth
+*.pt
+*.index
+*.wav
+*.flac
+*.mp3
+*.zip

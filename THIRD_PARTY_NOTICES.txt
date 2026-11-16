@@ -1,0 +1,26 @@
+Haruka Cover Studio 第三方来源与许可
+
+原创应用代码：Copyright (c) 2026 bakaxl-web，MIT，见 LICENSE。
+模型版包含修改后的 RVC 推理代码，适配专用 v6a/v6b.1/v6b.2/v6e 模型、全局条件和推理接口；不是未修改的上游发行版。
+
+React、React DOM、Scheduler：Meta Platforms, Inc. and affiliates，MIT。
+Electron：Electron contributors，MIT。Chromium 及其依赖许可见程序根目录 LICENSES.chromium.html。
+完整许可见 licenses/ 下对应文件。
+
+模型版额外包含：
+- RVC：liujing04、源文雨、Ftps 等贡献者，MIT。
+  https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+- VITS、HiFi-GAN、ContentVec：保留各自 MIT 许可和版权声明，见 licenses/。
+- HuBERT：Meta 的 HuBERT 模型；原模型卡标注 Apache-2.0。
+  https://huggingface.co/facebook/hubert-base-ls960
+  随包半精度转换文件来源：https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main/hubert_base
+- RMVPE：https://github.com/Dream-High/RMVPE ，Apache-2.0。
+  随包权重来源：https://huggingface.co/lj1995/VoiceConversionWebUI/blob/main/rmvpe.pt
+  转换文件发布仓库的模型卡标注 MIT；同时保留原始项目 Apache-2.0 许可。
+
+五个春香声线推理权重及两份检索索引由项目维护者提供并确认本次公开分发。
+应用源码的 MIT 许可不自动覆盖声线权重、声音、名称或其他第三方权利。
+各权重的版本、配套代码、质量状态与 SHA-256 见 resources/model-bundle/manifest.json。
+本次只确认技术试转，不表示所有声线已经过完整听感验收。
+
+两个轻量发行包均不携带 Python、PyTorch 或 FFmpeg；用户复用的外部软件遵循其各自许可。

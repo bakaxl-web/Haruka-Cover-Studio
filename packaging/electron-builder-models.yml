@@ -1,0 +1,46 @@
+appId: com.haruka.coverstudio.models
+productName: Haruka Cover Studio Models
+copyright: Copyright © 2026
+directories:
+  output: release-models
+  buildResources: packaging/assets
+files:
+  - electron/**/*
+  - '!electron/**/*.test.js'
+  - dist/**/*
+  - scripts/**/*
+  - package.json
+extraMetadata:
+  name: haruka-cover-studio-models
+  harukaLightweight: true
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - '**/*'
+      - '!.venv/**'
+      - '!**/__pycache__/**'
+      - '!**/*.pyc'
+      - '!tests/**'
+      - '!vendor/artifacts/**'
+      - '!presets/**'
+  - from: .build/model-bundle
+    to: model-bundle
+  - from: .build/model-bundle/presets
+    to: backend/presets
+extraFiles:
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD_PARTY_NOTICES.txt
+    to: THIRD_PARTY_NOTICES.txt
+  - from: licenses
+    to: licenses
+  - from: packaging/models-readme.txt
+    to: 模型版使用说明.txt
+win:
+  target:
+    - zip
+  icon: packaging/assets/icon.ico
+  artifactName: HarukaCoverStudio-Light-Models-${version}-win-x64.${ext}
+asar: true
+compression: normal

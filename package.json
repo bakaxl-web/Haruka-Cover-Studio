@@ -1,0 +1,42 @@
+{
+  "name": "haruka-cover-studio",
+  "version": "0.2.3",
+  "private": true,
+  "description": "本地 AI 翻唱工作台：RVC 歌声转换流水线",
+  "author": "Haruka Cover Studio",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev:web": "vite",
+    "dev:electron": "wait-on http://127.0.0.1:5173 && cross-env HARUKA_DEV=1 node scripts/launch-electron.js",
+    "dev": "concurrently -k -n vite,electron -c cyan,magenta \"npm:dev:web\" \"npm:dev:electron\"",
+    "build:web": "vite build",
+    "build:runtime": "pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/build-runtime.ps1",
+    "build:portable": "pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/build-portable.ps1",
+    "build:light": "npm run build:web && electron-builder --win zip --config packaging/electron-builder-light.yml",
+    "build:models": "npm run build:web && electron-builder --win zip --config packaging/electron-builder-models.yml",
+    "test:runtime": "node --test electron/*.test.js",
+    "start": "npm run build:web && node scripts/launch-electron.js",
+    "test:backend": "backend\\.venv\\Scripts\\python.exe -m pytest backend/tests -q"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^44.9.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bakaxl-web/Haruka-Cover-Studio.git"
+  }
+}

@@ -1,0 +1,43 @@
+appId: com.haruka.coverstudio.light
+productName: Haruka Cover Studio Light
+copyright: Copyright © 2026
+directories:
+  output: release-light
+  buildResources: packaging/assets
+files:
+  - electron/**/*
+  - '!electron/**/*.test.js'
+  - dist/**/*
+  - scripts/**/*
+  - package.json
+extraMetadata:
+  name: haruka-cover-studio-light
+  harukaLightweight: true
+extraFiles:
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD_PARTY_NOTICES.txt
+    to: THIRD_PARTY_NOTICES.txt
+  - from: licenses
+    to: licenses
+  - from: packaging/light-readme.txt
+    to: 轻量版使用说明.txt
+# 轻量版仅包含程序和后端代码，不携带解释器、推理环境或本机预设。
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!.venv/**"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+      - "!tests/**"
+      - "!vendor/artifacts/**"
+      - "!presets/**"
+win:
+  target:
+    - zip
+  icon: packaging/assets/icon.ico
+  artifactName: HarukaCoverStudio-Light-${version}-win-x64.${ext}
+asar: true
+compression: normal

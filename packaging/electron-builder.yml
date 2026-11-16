@@ -1,0 +1,48 @@
+appId: com.haruka.coverstudio
+productName: Haruka Cover Studio
+copyright: Copyright © 2026
+
+directories:
+  output: release
+  buildResources: packaging/assets
+
+files:
+  - electron/**/*
+  - '!electron/**/*.test.js'
+  - dist/**/*
+  - scripts/**/*
+  - package.json
+
+# 后端代码与 Python 运行时放在 asar 外部，便于定位解释器和读写模型配置
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!.venv/**"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+      - "!tests/**"
+      - "!vendor/artifacts/**"
+  - from: runtime
+    to: runtime
+    # 只打包翻唱运行所需目录，旧构建目录中的分离资产不会被带入新版。
+    filter:
+      - "python-base/**"
+      - "python-backend/**"
+      - "python-rvc/**"
+      - "rvc-app/**"
+      - "ffmpeg/**"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+
+win:
+  target:
+    - zip
+  icon: packaging/assets/icon.ico
+  artifactName: HarukaCoverStudio-${version}-win-x64.${ext}
+
+# 单文件 portable 对 4GB 以上体积支持不佳，改用解压即用的 zip
+
+asar: true
+compression: normal
