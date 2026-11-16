@@ -21,9 +21,12 @@ def client(tmp_path, monkeypatch):
     import json
     preset_dir = tmp_path / "builtin-presets"
     preset_dir.mkdir()
+    (tmp_path / "voice.pth").write_bytes(b"fixture-model")
+    (tmp_path / "voice.index").write_bytes(b"fixture-index")
     for preset_id in ("example-a", "example-b"):
         preset = {"id": preset_id, "display_name": preset_id, "engine": "rvc",
                   "model": {"path": str(tmp_path / "voice.pth")},
+                  "index": {"path": str(tmp_path / "voice.index")},
                   "parameters": dict(config.DEFAULT_PARAMETERS)}
         (preset_dir / f"{preset_id}.json").write_text(json.dumps(preset), encoding="utf-8")
     monkeypatch.setattr(config, "PRESET_DIR", preset_dir)

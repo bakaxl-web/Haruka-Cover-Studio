@@ -261,6 +261,15 @@ ipcMain.handle('choose-file', async (_event, options) => {
   return result.canceled ? null : result.filePaths[0]
 })
 
+// 批量页一次选择多首音频，仍只返回路径，不复制或改写原文件。
+ipcMain.handle('choose-files', async (_event, options) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: options?.title || '选择多首干声', properties: ['openFile', 'multiSelections'],
+    filters: options?.filters || [{ name: '音频文件', extensions: ['wav', 'flac', 'mp3', 'ogg'] }],
+  })
+  return result.canceled ? [] : result.filePaths
+})
+
 ipcMain.handle('reveal-in-folder', async (_event, targetPath) => {
   if (!targetPath) return false
   shell.showItemInFolder(targetPath)

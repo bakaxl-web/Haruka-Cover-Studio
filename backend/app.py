@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -19,6 +20,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import config
+from . import audio_preview
 from . import jobs as job_module
 from .contracts import ContractError, probe_audio
 from .engines import rvc, smoke
@@ -75,6 +77,9 @@ class CreateJobRequest(BaseModel):
     index_rate: Optional[float] = Field(default=None, ge=0, le=1)
     protect: Optional[float] = Field(default=None, ge=0, le=0.5)
     vocal_gain_db: Optional[float] = Field(default=None, ge=-12, le=12)
+    device: str = Field(default="auto", pattern=r"^(auto|cpu|cuda:[0-9]+)$")
+    preview_start: Optional[float] = Field(default=None, allow_inf_nan=False)
+    preview_end: Optional[float] = Field(default=None, allow_inf_nan=False)
     # 通用
     song_title: Optional[str] = None
     engine: Optional[str] = Field(default=None, description="仅开发自检使用 smoke")
@@ -90,6 +95,7 @@ def _job_payload(job: dict, log_lines: int = 40) -> dict:
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
         "error": job["error"],
+        "actual_device": job.get("actual_device"),
         "artifacts": job.get("artifacts", []),
         "output_dir": job["output_dir"],
         "request": {key: value for key, value in job.get("request", {}).items() if not key.startswith("_")},
@@ -127,10 +133,12 @@ def _submit(request: dict, runner) -> dict:
     return {"job_id": job["id"], "job": _job_payload(job_module.store.get(job["id"]))}
 
 
-def _create_cover_job(payload: CreateJobRequest) -> dict:
+def _prepare_cover_job(payload: CreateJobRequest) -> tuple[dict, object]:
     """RVC 翻唱任务：需要干声与声线，提供伴奏时才混音。"""
     if not payload.vocal_path:
         raise HTTPException(status_code=400, detail="翻唱任务需要 vocal_path")
+    if (payload.kind or "cover").strip().lower() != "cover":
+        raise HTTPException(status_code=400, detail="只支持 cover 任务")
     preset_map = config.presets_by_id()
     preset = preset_map.get(payload.preset_id or "")
     engine_name = payload.engine or (preset or {}).get("engine")
@@ -144,11 +152,18 @@ def _create_cover_job(payload: CreateJobRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"不支持的引擎：{engine_name}")
 
     # 轻量预检：只读元信息，完整有限值校验在引擎执行时进行
-    if engine_name != "smoke":
+    if engine_name != "smoke" or payload.preview_start is not None or payload.preview_end is not None:
         try:
-            probe_audio(Path(payload.vocal_path))
+            vocal_info = probe_audio(Path(payload.vocal_path))
+            if vocal_info['frames'] <= 0:
+                raise ContractError('干声不能为空')
+            if vocal_info['channels'] not in (1, 2):
+                raise ContractError('干声必须为单声道或双声道')
+            audio_preview.validate_selection(payload.preview_start, payload.preview_end, vocal_info['duration'])
             if payload.instrumental_path:
-                probe_audio(Path(payload.instrumental_path))
+                backing = probe_audio(Path(payload.instrumental_path))
+                if backing['channels'] != 2 or backing['samplerate'] != vocal_info['samplerate'] or abs(backing['frames'] - vocal_info['frames']) > 1:
+                    raise ContractError('伴奏须为双声道，且与干声采样率、帧数一致')
         except ContractError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -158,11 +173,23 @@ def _create_cover_job(payload: CreateJobRequest) -> dict:
         value = getattr(payload, key)
         if value is not None:
             preset.setdefault("parameters", {})[key] = value
+    if engine_name == 'rvc':
+        # 只检查本次实际使用的文件，不读取模型权重或完整音频；整批通过后才排队。
+        model_path = Path(preset.get('model', {}).get('path') or '')
+        if not model_path.is_file() or model_path.stat().st_size == 0:
+            raise HTTPException(400, f'模型文件不存在或为空：{model_path}')
+        if preset.get('parameters', {}).get('index_rate', 0) > 0:
+            index_path = Path(preset.get('index', {}).get('path') or '')
+            if not index_path.is_file() or index_path.stat().st_size == 0:
+                raise HTTPException(400, f'启用检索时需要有效索引文件：{index_path}')
     request = {
         "kind": "cover",
         "vocal_path": str(Path(payload.vocal_path).resolve()),
         "instrumental_path": str(Path(payload.instrumental_path).resolve()) if payload.instrumental_path else None,
         "pitch_semitones": payload.pitch_semitones,
+        "device": payload.device,
+        "preview_start": payload.preview_start,
+        "preview_end": payload.preview_end,
         "vocal_gain_db": payload.vocal_gain_db,
         "preset_id": payload.preset_id,
         "preset_display_name": preset.get("display_name", payload.preset_id),
@@ -170,7 +197,7 @@ def _create_cover_job(payload: CreateJobRequest) -> dict:
         "engine": engine_name,
         "_preset": preset,
     }
-    return _submit(request, runner)
+    return request, runner
 
 
 @app.post("/api/jobs", dependencies=[Depends(require_token)])
@@ -179,7 +206,57 @@ def create_job(payload: CreateJobRequest) -> dict:
     kind = (payload.kind or "cover").strip().lower()
     if kind != "cover":
         raise HTTPException(status_code=400, detail=f"不支持的任务类型：{kind}")
-    return _create_cover_job(payload)
+    return _submit(*_prepare_cover_job(payload))
+
+
+class BatchJobRequest(BaseModel):
+    items: list[CreateJobRequest] = Field(min_length=1, max_length=100)
+    group_kind: Literal['comparison', 'batch']
+
+
+@app.post('/api/jobs/batch', dependencies=[Depends(require_token)])
+def create_batch(payload: BatchJobRequest) -> dict:
+    # 所有轻量校验先完成，坏项不会留下已排队的半批任务。
+    prepared = [_prepare_cover_job(item) for item in payload.items]
+    if payload.group_kind == 'comparison':
+        if not 2 <= len(prepared) <= 8 or len({r['preset_id'] for r, _ in prepared}) != len(prepared):
+            raise HTTPException(400, '模型比较需要 2 至 8 个不同预设')
+        keys = ('vocal_path', 'instrumental_path', 'preview_start', 'preview_end', 'pitch_semitones', 'device')
+        if any(any(request[key] != prepared[0][0][key] for key in keys) for request, _ in prepared[1:]):
+            raise HTTPException(400, '模型比较必须使用相同音源、伴奏、区间、升降调和设备')
+    group_id = secrets.token_hex(8)
+    result = []
+    for request, runner in prepared:
+        request.update(group_id=group_id, group_kind=payload.group_kind)
+        result.append(_submit(request, runner)['job'])
+    return {'group_id': group_id, 'jobs': result}
+
+
+@app.post('/api/jobs/{job_id}/retry', dependencies=[Depends(require_token)])
+def retry_job(job_id: str) -> dict:
+    try:
+        job = job_module.store.get(job_id)
+    except job_module.JobNotFoundError as error:
+        raise HTTPException(404, '任务不存在') from error
+    if job['status'] not in ('failed', 'cancelled'):
+        raise HTTPException(409, '仅失败或已取消任务可以重试')
+    request = deepcopy(job['request'])
+    runner = ENGINES.get(request.get('engine'))
+    if runner is None:
+        raise HTTPException(400, '原任务引擎不可用')
+    return _submit(request, runner)
+
+
+class WaveformRequest(BaseModel):
+    path: str
+
+
+@app.post('/api/audio/waveform', dependencies=[Depends(require_token)])
+def get_waveform(payload: WaveformRequest) -> dict:
+    try:
+        return audio_preview.waveform(Path(payload.path))
+    except (ContractError, OSError, RuntimeError) as error:
+        raise HTTPException(400, str(error)) from error
 
 
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(require_token)])
@@ -225,7 +302,7 @@ async def job_events(job_id: str) -> StreamingResponse:
 
 
 @app.get("/api/jobs/{job_id}/source", dependencies=[Depends(require_token)])
-def play_source(job_id: str) -> FileResponse:
+def play_source(job_id: str, normalize: bool = False) -> FileResponse:
     """只播放已提交任务记录的干声，不接受任意文件路径。"""
     try:
         job = job_module.store.get(job_id)
@@ -234,11 +311,17 @@ def play_source(job_id: str) -> FileResponse:
     source = job.get("request", {}).get("vocal_path")
     if not source or not Path(source).is_file():
         raise HTTPException(status_code=404, detail="原始干声不存在")
+    try:
+        source = audio_preview.source_preview(job)
+        if normalize:
+            source = audio_preview.normalized_copy(source, Path(job['output_dir']))
+    except (ContractError, OSError, RuntimeError) as error:
+        raise HTTPException(400, str(error)) from error
     return FileResponse(source)
 
 
 @app.get("/api/jobs/{job_id}/artifacts/{name}", dependencies=[Depends(require_token)])
-def download_artifact(job_id: str, name: str, format: Optional[Literal["wav", "flac"]] = None):
+def download_artifact(job_id: str, name: str, format: Optional[Literal["wav", "flac"]] = None, normalize: bool = False):
     try:
         job = job_module.store.get(job_id)
     except job_module.JobNotFoundError as error:
@@ -248,12 +331,19 @@ def download_artifact(job_id: str, name: str, format: Optional[Literal["wav", "f
     target = Path(job["output_dir"]) / name
     if not target.is_file():
         raise HTTPException(status_code=404, detail="产物不存在")
+    if normalize:
+        if target.suffix.lower() not in ('.wav', '.flac'):
+            raise HTTPException(400, '只有音频可以进行试听音量匹配')
+        try:
+            return FileResponse(audio_preview.normalized_copy(target, Path(job['output_dir'])), media_type='audio/wav')
+        except (ContractError, OSError, RuntimeError) as error:
+            raise HTTPException(400, str(error)) from error
     if format == "flac":
         import soundfile as sf
         if target.suffix.lower() != ".wav":
             raise HTTPException(status_code=400, detail="只有音频产物可以导出 FLAC")
-        # 既有 WAV 产物均为 PCM16，逐样本无损转存，不改变原始文件。
-        samples, rate = sf.read(target, dtype="int16")
+        # 浮点试唱与旧 PCM16 均按归一化振幅导出；原始文件保持不变。
+        samples, rate = sf.read(target, dtype="float32")
         buffer = io.BytesIO()
         sf.write(buffer, samples, rate, format="FLAC", subtype="PCM_16")
         buffer.seek(0)
@@ -320,6 +410,22 @@ RVC_PROBE = (
     "'cuda': torch.cuda.is_available(),"
     "'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))"
 )
+
+
+@app.get('/api/devices', dependencies=[Depends(require_token)])
+def list_devices() -> dict:
+    devices = [{'id': 'auto', 'label': '自动选择', 'kind': 'auto'}, {'id': 'cpu', 'label': 'CPU（兼容模式）', 'kind': 'cpu'}]
+    detail = '自动选择可用 NVIDIA CUDA，否则使用 CPU。AMD / DirectML 尚未支持，请使用 CPU。'
+    code = ("import torch,json;print(json.dumps({'devices':[{'id':'cuda:'+str(i),'label':torch.cuda.get_device_name(i),'kind':'cuda'} for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []}))")
+    try:
+        probe = _probe_python(Path(config.resolve_inference_python()), code)
+        if probe['ok']:
+            devices.extend(probe['data'].get('devices', []))
+        else:
+            detail += ' 检测失败：' + probe['error']
+    except (OSError, RuntimeError) as error:
+        detail += ' 检测失败：' + str(error)
+    return {'devices': devices, 'detail': detail}
 
 @app.get("/api/diagnostics", dependencies=[Depends(require_token)])
 def diagnostics() -> dict:

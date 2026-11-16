@@ -12,9 +12,12 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import json
 from pathlib import Path
 
 from .. import config
+from .. import audio_preview
 from ..contracts import ContractError, sha256_file, validate_inputs, validate_output
 from ..jobs import JobContext
 
@@ -72,6 +75,8 @@ def _build_inference_command(preset: dict, request: dict, output_path: Path) -> 
         "--pitch-semitones", str(request.get("pitch_semitones", 0)),
     ]
     index_path = preset.get("index", {}).get("path")
+    if request.get('device') is not None:
+        command += ['--device', request['device']]
     if index_path:
         command += ["--index", index_path]
     if params.get("v6b1_global"):
@@ -113,6 +118,15 @@ def _run_inference(preset: dict, request: dict, output_path: Path, job_dir: Path
         errors="replace",
     )
 
+    # 独立观察取消标志，子进程长期不输出日志时也可以立即结束。
+    finished = threading.Event()
+    def watch_cancel():
+        while not finished.wait(.1):
+            if ctx.cancel_requested:
+                _terminate(process)
+                return
+    watcher = threading.Thread(target=watch_cancel, daemon=True)
+    watcher.start()
     total_chunks = 0
     try:
         assert process.stdout is not None
@@ -134,9 +148,16 @@ def _run_inference(preset: dict, request: dict, output_path: Path, job_dir: Path
                     ctx.stage("converting", CHUNK_PROGRESS_BASE + CHUNK_PROGRESS_SPAN * ratio)
         returncode = process.wait()
     finally:
+        finished.set()
         if process.poll() is None:
             _terminate(process)
+        process.wait()
+        watcher.join(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
 
+    if ctx.cancel_requested:
+        raise JobCancelled('任务已取消')
     if returncode != 0:
         raise RuntimeError(f"RVC 推理失败（退出码 {returncode}），详见任务日志")
     if not output_path.is_file():
@@ -144,7 +165,7 @@ def _run_inference(preset: dict, request: dict, output_path: Path, job_dir: Path
     ctx.log(f"[rvc] 推理完成，共 {total_chunks} 个块")
 
 
-def _resample_to_44k(vocal_40k: Path, output_44k: Path, ctx: JobContext) -> dict:
+def _resample_to_44k(vocal_40k: Path, output_44k: Path, ctx: JobContext, expected_frames: int | None = None) -> dict:
     """把 40 kHz 纯人声重采样到 44.1 kHz，帧数按比例取整截断。"""
     import numpy as np
     import soundfile as sf
@@ -154,7 +175,8 @@ def _resample_to_44k(vocal_40k: Path, output_44k: Path, ctx: JobContext) -> dict
     if samplerate != 40000:
         raise ContractError(f"预期 40 kHz 推理产物，实际 {samplerate} Hz")
 
-    expected_frames = int(len(audio) * 44100 / 40000)
+    if expected_frames is None:
+        expected_frames = int(len(audio) * 44100 / 40000)
     runtime_path = config.VENDOR_DIR / "rvc_runtime.py"
     converted = None
     if runtime_path.is_file():
@@ -217,11 +239,26 @@ def _mix(vocal_44k: Path, instrumental: Path, output: Path, boost_db: float, ctx
         "--output", str(output),
         "--boost-db", str(boost_db),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    ctx.log(result.stdout.strip())
-    if result.returncode != 0:
-        ctx.log(result.stderr.strip())
-        raise RuntimeError(f"混音失败（退出码 {result.returncode}）")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, encoding='utf-8', errors='replace')
+    try:
+        while True:
+            if ctx.cancel_requested:
+                _terminate(process)
+                raise JobCancelled('任务已取消')
+            try:
+                stdout, stderr = process.communicate(timeout=.1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if process.poll() is None:
+            _terminate(process)
+        process.communicate()
+    ctx.log(stdout.strip())
+    if process.returncode != 0:
+        ctx.log(stderr.strip())
+        raise RuntimeError(f"混音失败（退出码 {process.returncode}）")
     validate_output(output, expect_samplerate=44100, expect_channels=2)
 
 
@@ -239,18 +276,63 @@ def run(job: dict, ctx: JobContext) -> list[dict]:
 
     # 推理前先做输入合同校验，避免白跑一次 GPU
     instrumental = Path(request["instrumental_path"]) if request.get("instrumental_path") else None
-    validate_inputs(Path(request["vocal_path"]), instrumental)
+    inputs = validate_inputs(Path(request["vocal_path"]), instrumental)
 
     vocal_40k = job_dir / f"converted_vocal_40k_mono_{preset_id}.wav"
     vocal_44k = job_dir / f"converted_vocal_44k_mono_{preset_id}_exact.wav"
     song_title = request.get("song_title") or "cover"
     mix_output = job_dir / f"{song_title}_{preset_id}_伴奏混音.wav"
 
-    _run_inference(preset, request, vocal_40k, job_dir, ctx)
+    preview = request.get('preview_start') is not None
+    selection = None
+    if preview:
+        start, end = request['preview_start'], request['preview_end']
+        audio_preview.validate_selection(start, end, inputs['vocal']['duration'])
+        context_path = job_dir / '.inference_context.wav'
+        context = audio_preview.extract(Path(request['vocal_path']), context_path,
+                                        max(0., start - .5), min(inputs['vocal']['duration'], end + .5))
+        source_path = audio_preview.source_preview(job)
+        selection = {'original_vocal_path': request['vocal_path'], 'original_instrumental_path': request.get('instrumental_path'),
+                     'start': start, 'end': end, 'context': context, 'source_preview': str(source_path)}
+        inference_output = job_dir / '.converted_context.wav'
+        _run_inference(preset, dict(request, vocal_path=str(context_path)), inference_output, job_dir, ctx)
+        import soundfile as sf
+        import numpy as np
+        samples, rate = sf.read(inference_output, dtype='float32')
+        first = round((start - context['start']) * 40000)
+        count = round((end - start) * 40000)
+        if rate != 40000 or first + count > len(samples):
+            raise ContractError('试唱推理输出未完整覆盖所选区间')
+        sf.write(vocal_40k, samples[first:first + count], rate, subtype='FLOAT')
+        validate_output(vocal_40k, expect_samplerate=40000, expect_channels=1)
+        report = json.loads(inference_output.with_suffix('.report.json').read_text(encoding='utf-8'))
+        report['preview'] = selection
+        report['context_output'] = report.get('output')
+        report['output'] = validate_output(vocal_40k, expect_samplerate=40000, expect_channels=1)
+        vocal_40k.with_suffix('.report.json').write_text(json_dumps(report), encoding='utf-8')
+        if instrumental is not None:
+            backing_path = job_dir / '.instrumental_selection.wav'
+            audio_preview.extract(instrumental, backing_path, start, end)
+            backing_audio, backing_rate = sf.read(backing_path, dtype='float32', always_2d=True)
+            from scipy.signal import resample_poly
+            from math import gcd
+            divisor = gcd(backing_rate, 44100)
+            backing_audio = resample_poly(backing_audio, 44100 // divisor, backing_rate // divisor, axis=0)
+            count_44k = round((end - start) * 44100)
+            backing_audio = backing_audio[:count_44k]
+            if len(backing_audio) < count_44k:
+                backing_audio = np.pad(backing_audio, ((0, count_44k - len(backing_audio)), (0, 0)), mode='edge')
+            instrumental = job_dir / '.instrumental_44k.wav'
+            sf.write(instrumental, backing_audio, 44100, subtype='FLOAT')
+    else:
+        _run_inference(preset, request, vocal_40k, job_dir, ctx)
+    inference_report = json.loads(vocal_40k.with_suffix('.report.json').read_text(encoding='utf-8'))
+    if inference_report.get('actual_device'):
+        ctx.update(actual_device=inference_report['actual_device'])
     if ctx.cancel_requested:
         raise JobCancelled("任务已取消")
 
-    _resample_to_44k(vocal_40k, vocal_44k, ctx)
+    _resample_to_44k(vocal_40k, vocal_44k, ctx, round((request['preview_end'] - request['preview_start']) * 44100) if preview else None)
     if ctx.cancel_requested:
         raise JobCancelled("任务已取消")
 

@@ -9,6 +9,8 @@ import json
 import secrets
 import threading
 import traceback
+from collections import deque
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -60,7 +62,9 @@ class JobStore:
         self.output_root = Path(output_root)
         self._lock = threading.RLock()
         self._jobs: dict[str, dict] = {}
-        self._threads: dict[str, threading.Thread] = {}
+        self._pending = deque()
+        self._scheduled: set[str] = set()
+        self._worker: threading.Thread | None = None
         # 重启后恢复已保存的作品；中断的任务只标为失败，不自动重新占用 GPU。
         for record in self.output_root.glob("*/job.json"):
             try:
@@ -88,7 +92,7 @@ class JobStore:
                 "progress": 0.0,
                 "created_at": _now(),
                 "updated_at": _now(),
-                "request": request,
+                "request": deepcopy(request),
                 "artifacts": [],
                 "error": None,
                 "cancel_requested": False,
@@ -98,14 +102,14 @@ class JobStore:
             (job_dir / "job.log").touch()
             self._jobs[job_id] = job
             self._persist(job_id)
-            return dict(job)
+            return deepcopy(job)
 
     def get(self, job_id: str) -> dict:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 raise JobNotFoundError(job_id)
-            return dict(job)
+            return deepcopy(job)
 
     def list_all(self) -> list[dict]:
         with self._lock:
@@ -161,7 +165,7 @@ class JobStore:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             return []
-        return lines[-max_lines:]
+        return lines[-max_lines:] if max_lines > 0 else []
 
     def _persist(self, job_id: str) -> None:
         job = self._jobs[job_id]
@@ -174,15 +178,35 @@ class JobStore:
 
     # ---- 执行 ----
     def start(self, job_id: str, runner: Callable[[dict, JobContext], list[dict]]) -> None:
-        thread = threading.Thread(target=self._run, args=(job_id, runner), daemon=True, name=f"job-{job_id}")
+        # 每个存储仅有一个消费线程，队列任务不各自占用线程或推理资源。
         with self._lock:
-            self._threads[job_id] = thread
-        thread.start()
+            if self.get(job_id)["status"] != "queued" or job_id in self._scheduled:
+                return
+            self._scheduled.add(job_id)
+            self._pending.append((job_id, runner))
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._consume, daemon=True, name="inference-queue")
+                self._worker.start()
+
+    def _consume(self) -> None:
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._worker = None
+                    return
+                job_id, runner = self._pending.popleft()
+                if self._jobs[job_id]["status"] != "queued":
+                    self._scheduled.discard(job_id)
+                    continue
+                self.update(job_id, status="running", stage="starting", progress=0.0)
+            self._run(job_id, runner)
 
     def _run(self, job_id: str, runner: Callable[[dict, JobContext], list[dict]]) -> None:
         context = JobContext(self, job_id)
         try:
-            self.update(job_id, status="running", stage="starting", progress=0.0)
+            if context.cancel_requested:
+                self.update(job_id, status="cancelled", stage="cancelled")
+                return
             artifacts = runner(self.get(job_id), context) or []
             if context.cancel_requested:
                 self.update(job_id, status="cancelled", stage="cancelled")
@@ -196,7 +220,7 @@ class JobStore:
                 self.update(job_id, status="failed", stage="failed", error=str(error))
         finally:
             with self._lock:
-                self._threads.pop(job_id, None)
+                self._scheduled.discard(job_id)
 
 
 store = JobStore(config.OUTPUT_ROOT)

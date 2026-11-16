@@ -19,6 +19,7 @@ declare global {
         title?: string
         filters?: { name: string; extensions: string[] }[]
       }) => Promise<string | null>
+      chooseFiles: (options?: { title?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<string[]>
       revealInFolder: (targetPath: string) => Promise<boolean>
       openDir: (dirPath: string) => Promise<boolean>
       filePath: (file: File) => string

@@ -1,6 +1,6 @@
 {
   "name": "haruka-cover-studio",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "private": true,
   "description": "本地 AI 翻唱工作台：RVC 歌声转换流水线",
   "author": "Haruka Cover Studio",

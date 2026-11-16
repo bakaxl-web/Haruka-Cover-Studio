@@ -282,6 +282,30 @@ def require_v6b1_global_model(net_g) -> None:
         raise ValueError("--v6b1-global 仅支持显式标记的 v6b.1 模型")
 
 
+def configure_inference_device(config, requested):
+    """在创建 VC 前设置全链路设备；未传新参数时保留旧调用行为。"""
+    if requested is None:
+        return str(config.device)
+    import torch
+
+    cuda_available = torch.cuda.is_available() and not getattr(torch.version, 'hip', None)
+    device = ('cuda:0' if cuda_available else 'cpu') if requested == 'auto' else requested
+    if device != 'cpu':
+        if not device.startswith('cuda:') or not device[5:].isdigit():
+            raise ValueError(f'不支持的推理设备：{device}')
+        index = int(device[5:])
+        if not cuda_available or index >= torch.cuda.device_count():
+            raise ValueError(f'请求的 CUDA 设备不可用：{device}')
+    config.device = device
+    config.dml = False
+    if device == 'cpu':
+        config.is_half = False
+        config.dtype = torch.float32
+    else:
+        config.dtype = torch.float16 if config.is_half else torch.float32
+    return device
+
+
 def configure_rmvpe_device(device: str) -> None:
     """为低显存评测显式选择 RMVPE 设备，不改生成器和输入参数。"""
     if device not in {"auto", "cuda", "cpu"}:
@@ -708,6 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crossfade-ms", type=float, default=0.0)
     parser.add_argument("--strict-output-frames", action="store_true")
     parser.add_argument("--seed", type=int, default=20260815)
+    parser.add_argument('--device', default=None, help='整条推理链设备：auto、cpu 或 cuda:N；省略时沿用旧行为')
     parser.add_argument(
         "--rmvpe-device",
         choices=("auto", "cuda", "cpu"),
@@ -771,12 +796,13 @@ def main(argv: list[str] | None = None) -> int:
     configure_inference_seed(args.seed)
     os.environ["weight_root"] = str(model_path.parent)
     config = run_logged_stage("创建推理配置", create_config)
+    actual_device = configure_inference_device(config, args.device)
     print(f"设备：{config.device} | 精度：{config.dtype}", flush=True)
     print(f"模型：{model_path.name}", flush=True)
     print(f"索引：{resolve_index_for_inference(index_path) if index_path else '无索引'}", flush=True)
     vc = run_logged_stage("初始化RVC实例", VC, config)
     run_logged_stage("加载转换模型", vc.get_vc, model_path.name)
-    configure_rmvpe_device(args.rmvpe_device)
+    configure_rmvpe_device(('cpu' if actual_device == 'cpu' else 'auto') if args.device is not None else args.rmvpe_device)
     if args.v6b1_global:
         if args.f0_method != "rmvpe":
             raise ValueError("--v6b1-global 当前只支持 RMVPE F0")
@@ -892,6 +918,8 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "status": "technical_pass",
         "quality_status": "quality_pending",
+        "requested_device": args.device,
+        "actual_device": actual_device,
         "source": {
             "path": str(source_path),
             "sha256": sha256(source_path),

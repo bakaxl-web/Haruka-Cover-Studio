@@ -43,6 +43,16 @@ export type Job = {
   output_dir: string
   log_tail?: string[]
   request?: Record<string, unknown>
+  actual_device?: string
+}
+
+export type DeviceOption = { id: string; label: string; kind: 'auto' | 'cpu' | 'cuda' }
+export type PreviewRange = { start: number; end: number }
+export type CoverRequest = {
+  kind: 'cover'; vocal_path: string; instrumental_path: string | null; preset_id: string
+  song_title?: string | null; pitch_semitones: number; device: string
+  index_rate?: number; protect?: number; vocal_gain_db?: number
+  preview_start?: number | null; preview_end?: number | null
 }
 
 export type ApiCall = (path: string, init?: RequestInit) => Promise<Response>

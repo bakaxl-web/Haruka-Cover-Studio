@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('haruka', {
   applyRuntime: (settings) => ipcRenderer.invoke('runtime-apply', settings),
   chooseDirectory: (title) => ipcRenderer.invoke('choose-directory', title),
   chooseFile: (options) => ipcRenderer.invoke('choose-file', options),
+  chooseFiles: (options) => ipcRenderer.invoke('choose-files', options),
   revealInFolder: (targetPath) => ipcRenderer.invoke('reveal-in-folder', targetPath),
   openDir: (dirPath) => ipcRenderer.invoke('open-dir', dirPath),
   filePath: (file) => webUtils.getPathForFile(file),
